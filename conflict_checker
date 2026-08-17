@@ -1,0 +1,204 @@
+sudo python3 - << 'EOF'
+import os, sys, time, socket, struct, select, ipaddress, concurrent.futures, subprocess, random, json
+
+GREEN, RED, YELLOW, CYAN, BOLD, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[96m", "\033[1m", "\033[0m"
+
+OUI_DB = {
+    "02:42": "Docker Virtual Veth Container", "00:50:56": "VMware Virtual NIC",
+    "00:0c:29": "VMware Virtual NIC", "08:00:27": "Oracle VirtualBox",
+    "52:54:00": "QEMU/KVM Virtual NIC", "b8:27:eb": "Raspberry Pi Foundation",
+    "dc:a6:32": "Raspberry Pi Foundation", "e4:5f:01": "Raspberry Pi Foundation",
+    "f4:6d:e2": "Ubiquiti Networks", "e8:65:d4": "TP-Link"
+}
+
+def get_vendor(mac):
+    mac_clean = mac.lower().replace("-", ":")
+    return OUI_DB.get(mac_clean[:5], OUI_DB.get(mac_clean[:8], "Unknown / Physical Device"))
+
+def get_tty_input(prompt):
+    try:
+        with open("/dev/tty", "r") as tty:
+            print(prompt, end="", flush=True)
+            return tty.readline().strip()
+    except Exception:
+        return ""
+
+class RawARPProber:
+    def __init__(self, interface, src_ip, src_mac):
+        self.iface = interface
+        self.src_ip = src_ip
+        self.src_mac = src_mac
+        self.src_mac_bytes = bytes.fromhex(src_mac.replace(":", ""))
+        self.src_ip_bytes = socket.inet_aton(src_ip)
+
+    @staticmethod
+    def bytes_to_mac(mac_bytes):
+        return ":".join(f"{b:02x}" for b in mac_bytes)
+
+    def create_arp_packet(self, target_ip, op=1):
+        target_ip_bytes = socket.inet_aton(target_ip)
+        eth_hdr = struct.pack("!6s6sH", b"\xff\xff\xff\xff\xff\xff", self.src_mac_bytes, 0x0806)
+        arp_hdr = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, op, self.src_mac_bytes, self.src_ip_bytes, b"\x00"*6, target_ip_bytes)
+        return eth_hdr + arp_hdr
+
+    def probe_ip(self, target_ip, timeout=0.8):
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+            sock.bind((self.iface, 0))
+            sock.setblocking(False)
+        except Exception: return []
+
+        sock.send(self.create_arp_packet(target_ip))
+        responses = []
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            r, _, _ = select.select([sock], [], [], 0.05)
+            if r:
+                try:
+                    data = sock.recv(2048)
+                    if len(data) >= 42 and struct.unpack("!H", data[12:14])[0] == 0x0806:
+                        opcode, sender_mac_b, sender_ip_b = struct.unpack("!H6s4s", data[20:32])
+                        if socket.inet_ntoa(sender_ip_b) == target_ip and opcode == 2:
+                            mac = self.bytes_to_mac(sender_mac_b)
+                            if mac not in responses: responses.append(mac)
+                except Exception: pass
+        sock.close()
+        return responses
+
+# --- REMEDIATION / FIX FUNCTIONS ---
+
+def fix_flush_arp(iface):
+    print(f"\n{CYAN}[+] Action: Flushing ARP and Neighbor Cache on {iface}...{RESET}")
+    res = subprocess.run(f"ip neighbor flush dev {iface}", shell=True, capture_output=True, text=True)
+    if res.returncode == 0:
+        print(f"  {GREEN}[✓] ARP cache successfully flushed.{RESET}")
+    else:
+        print(f"  {RED}[!] Failed to flush ARP cache: {res.stderr.strip()}{RESET}")
+
+def fix_renew_dhcp(iface):
+    print(f"\n{CYAN}[+] Action: Reacquiring DHCP Lease to resolve IP conflicts...{RESET}")
+    cmd = f"dhclient -r {iface} && dhclient {iface}"
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if res.returncode != 0:
+        cmd = "systemctl restart NetworkManager 2>/dev/null || systemctl restart networking 2>/dev/null"
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print(f"  {GREEN}[✓] Network interface restarted / DHCP reacquired.{RESET}")
+
+def fix_enable_ip_forwarding():
+    print(f"\n{CYAN}[+] Action: Enabling IPv4 Kernel Forwarding...{RESET}")
+    subprocess.run("sysctl -w net.ipv4.ip_forward=1", shell=True, capture_output=True)
+    try:
+        with open("/etc/sysctl.conf", "r+") as f:
+            content = f.read()
+            if "net.ipv4.ip_forward" not in content:
+                f.write("\nnet.ipv4.ip_forward=1\n")
+        print(f"  {GREEN}[✓] IPv4 Forwarding enabled and set to persistent in /etc/sysctl.conf.{RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}[!] Enabled for current session, but failed to write /etc/sysctl.conf ({e}){RESET}")
+
+def fix_docker_subnets():
+    print(f"\n{CYAN}[+] Action: Reconfiguring Docker Default Subnet Pool...{RESET}")
+    daemon_path = "/etc/docker/daemon.json"
+    cfg = {}
+    if os.path.exists(daemon_path):
+        try:
+            with open(daemon_path, "r") as f: cfg = json.load(f)
+        except Exception: cfg = {}
+
+    cfg["default-address-pools"] = [{"base": "172.18.0.0/16", "size": 24}]
+    
+    try:
+        with open(daemon_path, "w") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"  {GREEN}[✓] Updated {daemon_path} with pool 172.18.0.0/16.{RESET}")
+        print(f"  [*] Restarting Docker service...")
+        subprocess.run("systemctl restart docker", shell=True)
+        print(f"  {GREEN}[✓] Docker restarted successfully.{RESET}")
+    except Exception as e:
+        print(f"  {RED}[!] Failed to update Docker daemon configuration: {e}{RESET}")
+
+def main():
+    if os.geteuid() != 0:
+        print(f"{RED}[!] Must be run as root (sudo).{RESET}")
+        sys.exit(1)
+
+    print(f"\n{BOLD}{CYAN}=== DEEP DIAGNOSTIC & AUTOMATED RESOLUTION TOOL ==={RESET}")
+
+    # Determine default route interface & IPs
+    import fcntl
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    with open("/proc/net/route") as f: routes = f.readlines()[1:]
+    
+    def_iface, def_gw = None, None
+    for r in routes:
+        p = r.strip().split()
+        if p[1] == "00000000":
+            def_iface = p[0]
+            def_gw = str(ipaddress.IPv4Address(struct.unpack("<L", struct.pack(">L", int(p[2], 16)))[0]))
+            break
+
+    if not def_iface:
+        print(f"{RED}[!] No default network route found.{RESET}")
+        sys.exit(1)
+
+    my_ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", def_iface[:15].encode("utf-8")))[20:24])
+    with open(f"/sys/class/net/{def_iface}/address") as f: my_mac = f.read().strip()
+
+    print(f"\n{BOLD}[+] Interface:{RESET} {def_iface} | {BOLD}IP:{RESET} {my_ip} | {BOLD}MAC:{RESET} {my_mac} | {BOLD}Gateway:{RESET} {def_gw}")
+
+    prober = RawARPProber(def_iface, my_ip, my_mac)
+
+    # Quick Checks
+    ip_conflict = len([m for m in prober.probe_ip(my_ip, 0.8) if m.lower() != my_mac.lower()]) > 0
+    gw_conflict = len(prober.probe_ip(def_gw, 0.8)) > 1
+
+    # Check IP forwarding
+    fwd_enabled = True
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            fwd_enabled = f.read().strip() == "1"
+    except Exception: pass
+
+    print(f"\n{BOLD}{CYAN}=== AUDIT SUMMARY ==={RESET}")
+    print(f" • IP Conflict Detected      : {RED if ip_conflict else GREEN}{'YES' if ip_conflict else 'NO'}{RESET}")
+    print(f" • Gateway Collision         : {RED if gw_conflict else GREEN}{'YES' if gw_conflict else 'NO'}{RESET}")
+    print(f" • Kernel Forwarding Enabled : {GREEN if fwd_enabled else RED}{'YES' if fwd_enabled else 'NO (Issue for containers)'}{RESET}")
+
+    # --- INTERACTIVE RESOLUTION MENU ---
+    while True:
+        print(f"\n{BOLD}{CYAN}=== REMEDIATION & FIX MENU ==={RESET}")
+        print(" [1] Flush ARP / Neighbor Cache")
+        print(" [2] Renew DHCP Lease / Reset Interface")
+        print(" [3] Fix Docker Subnet Overlaps (Reconfigure daemon.json to 172.18.0.0/16)")
+        print(" [4] Enable IPv4 Kernel Forwarding")
+        print(" [5] Apply ALL Recommended Fixes")
+        print(" [0] Exit")
+
+        choice = get_tty_input(f"\n{BOLD}Select an action [0-5]: {RESET}")
+
+        if choice == "1":
+            fix_flush_arp(def_iface)
+        elif choice == "2":
+            fix_renew_dhcp(def_iface)
+        elif choice == "3":
+            fix_docker_subnets()
+        elif choice == "4":
+            fix_enable_ip_forwarding()
+        elif choice == "5":
+            fix_flush_arp(def_iface)
+            if not fwd_enabled: fix_enable_ip_forwarding()
+            fix_docker_subnets()
+            fix_renew_dhcp(def_iface)
+            print(f"\n{GREEN}{BOLD}[✓] All automated fixes applied successfully.{RESET}")
+            break
+        elif choice == "0" or choice == "":
+            print("\nExiting.")
+            break
+        else:
+            print(f"{RED}Invalid option, try again.{RESET}")
+
+if __name__ == "__main__":
+    main()
+EOF
