@@ -3,7 +3,6 @@ import os
 import subprocess
 import time
 import sys
-import re
 
 # ANSI Color Codes
 GREEN = '\033[92m'
@@ -25,7 +24,7 @@ def get_tty_input(prompt):
         return tty.readline().strip()
 
 print(f"{BLUE}=========================================={RESET}")
-print(f"{BLUE}    Advanced Mac Drive Diagnostic Tool    {RESET}")
+print(f"{BLUE}    Advanced Mac Drive Diagnostic & Fixer {RESET}")
 print(f"{BLUE}=========================================={RESET}")
 
 print(f"\n{CYAN}[Available Disks & Partitions]{RESET}")
@@ -46,6 +45,79 @@ print(f"\n{CYAN}[2/3] Verifying File System for {target}...{RESET}")
 verify_output = run_cmd(f"diskutil verifyVolume {target}")
 print(verify_output)
 
+corruption_detected = "appears to be OK" not in verify_output
+
+if corruption_detected:
+    print(f"\n{RED}[!] FILE SYSTEM CORRUPTION / ISSUES DETECTED!{RESET}")
+    print(f"{YELLOW}--- EXACT VERIFICATION OUTPUT ---{RESET}")
+    print(f"{RED}{verify_output}{RESET}")
+    print(f"{YELLOW}---------------------------------{RESET}")
+    
+    print(f"\n{CYAN}Choose a recovery/repair action:{RESET}")
+    print("  [1] Attempt Standard Repair (Safe, fixes minor structural issues)")
+    print("  [2] Automated Deep Fix for Exit Code 8 / Superblock Errors (Rebuilds structural nodes)")
+    print("  [3] Mount Read-Only & Backup Data (Safest before wiping)")
+    print("  [4] Force Unmount and Re-index")
+    print("  [5] Erase and Reformat Drive (Deep wipe for hardware-recalcitrant errors)")
+    print("  [6] Skip and proceed to speed test")
+    
+    choice = get_tty_input("\nEnter your choice (1-6): ")
+    
+    if choice == '1':
+        print(f"\n{CYAN}Running standard diskutil repairVolume...{RESET}")
+        repair_output = run_cmd(f"diskutil repairVolume {target}")
+        print(repair_output)
+        verify_output = run_cmd(f"diskutil verifyVolume {target}")
+        
+    elif choice == '2':
+        print(f"\n{YELLOW}[!] Initiating Advanced Deep Fix Sequence for Persistent Errors...{RESET}")
+        print(f"{CYAN}Step A: Forcing unmount of target {target}...{RESET}")
+        subprocess.run(["diskutil", "unmount", "force", target])
+        
+        print(f"{CYAN}Step B: Running low-level file system check & repair (fsck_apfs / fsck_hfs)...{RESET}")
+        # Detect file system type from info output
+        fs_type = "apfs"
+        if "HFS" in info_output:
+            fs_type = "hfs"
+            
+        fix_cmd = f"sudo fsck_{fs_type} -y /dev/{target}"
+        print(f"Executing: {fix_cmd}")
+        subprocess.run(fix_cmd, shell=True)
+        
+        print(f"{CYAN}Step C: Remounting and re-verifying volume structure...{RESET}")
+        subprocess.run(["diskutil", "mount", target])
+        verify_output = run_cmd(f"diskutil verifyVolume {target}")
+        print(verify_output)
+        
+    elif choice == '3':
+        print(f"\n{CYAN}Attempting to force mount as Read-Only for backup...{RESET}")
+        mount_ro = run_cmd(f"diskutil mount readOnly {target}")
+        print(mount_ro)
+        print(f"{GREEN}Check Finder or Desktop to copy your files immediately!{RESET}")
+        
+    elif choice == '4':
+        print(f"\n{CYAN}Forcing unmount and refresh...{RESET}")
+        subprocess.run(["diskutil", "unmount", "force", target])
+        subprocess.run(["diskutil", "mount", target])
+        
+    elif choice == '5':
+        print(f"\n{RED}[WARNING] This will completely wipe all data on {target}.{RESET}")
+        confirm = get_tty_input("Are you 100% sure you want to erase and reformat? Type 'YES' to confirm: ")
+        if confirm == 'YES':
+            format_name = get_tty_input("Enter a new name for the drive (e.g., Backup): ") or "Disk"
+            print(f"\n{CYAN}Erasing and reformatting {target} to APFS...{RESET}")
+            erase_output = run_cmd(f"diskutil eraseVolume APFS '{format_name}' {target}")
+            print(erase_output)
+            print(f"{GREEN}Format complete. Re-running verification...{RESET}")
+            verify_output = run_cmd(f"diskutil verifyVolume {target}")
+        else:
+            print("Erasing cancelled.")
+    else:
+        print("Skipping repair actions.")
+
+# Post-repair check
+still_corrupted = "appears to be OK" not in verify_output
+
 # Extract details for diagnostics
 smart_status = "Unknown"
 protocol = "Unknown"
@@ -64,17 +136,29 @@ for line in info_output.split('\n'):
         if len(parts) > 1:
             mount_point = parts[1].strip()
 
+# Attempt to mount if unmounted
+if not mount_point or mount_point == "Not Mounted":
+    print(f"\n{YELLOW}[!] Target is unmounted. Attempting to mount {target}...{RESET}")
+    mount_out = run_cmd(f"diskutil mount {target}")
+    print(mount_out)
+    info_output = run_cmd(f"diskutil info {target}")
+    for line in info_output.split('\n'):
+        if "Mount Point" in line:
+            parts = line.split(":", 1)
+            if len(parts) > 1:
+                mount_point = parts[1].strip()
+
 write_mb_s = 0.0
 read_mb_s = 0.0
 
 if not mount_point or mount_point == "Not Mounted":
-    print(f"\n{YELLOW}[3/3] Warning: Target is not mounted. Skipping speed test.{RESET}")
+    print(f"\n{YELLOW}[3/3] Warning: Target is still not mounted. Skipping speed test.{RESET}")
 else:
     print(f"\n{CYAN}[3/3] Running Blackmagic-Style Speed Test on [{mount_point}]...{RESET}")
     test_file = os.path.join(mount_point, "python_speed_test.tmp")
     
-    block_size = 1024 * 1024  # 1 MB blocks
-    total_size = 1024 * block_size  # 1 GB total
+    block_size = 1024 * 1024
+    total_size = 1024 * block_size
     chunk = b'\0' * block_size
 
     # Write Test
@@ -94,67 +178,61 @@ else:
         write_mb_s = (total_size / (1024 * 1024)) / duration
         print(f"--> Write Speed: {GREEN}{write_mb_s:.2f} MB/s{RESET}")
     except Exception as e:
-        print(f"{RED}Write error: {e}{RESET}")
+        print(f"{RED}Write error (Drive might be Read-Only or locked): {e}{RESET}")
         if os.path.exists(test_file):
             os.remove(test_file)
-        exit(1)
 
     # Read Test
-    print("Reading 1GB temporary file...")
-    start_time = time.perf_counter()
-    try:
-        with open(test_file, "rb") as f:
-            while True:
-                data = f.read(block_size)
-                if not data:
-                    break
-        end_time = time.perf_counter()
-        
-        duration = end_time - start_time
-        read_mb_s = (total_size / (1024 * 1024)) / duration
-        print(f"--> Read Speed:  {GREEN}{read_mb_s:.2f} MB/s{RESET}")
-    except Exception as e:
-        print(f"{RED}Read error: {e}{RESET}")
-
-    # Cleanup
     if os.path.exists(test_file):
-        os.remove(test_file)
+        print("Reading 1GB temporary file...")
+        start_time = time.perf_counter()
+        try:
+            with open(test_file, "rb") as f:
+                while True:
+                    data = f.read(block_size)
+                    if not data:
+                        break
+            end_time = time.perf_counter()
+            
+            duration = end_time - start_time
+            read_mb_s = (total_size / (1024 * 1024)) / duration
+            print(f"--> Read Speed:  {GREEN}{read_mb_s:.2f} MB/s{RESET}")
+        except Exception as e:
+            print(f"{RED}Read error: {e}{RESET}")
+
+        if os.path.exists(test_file):
+            os.remove(test_file)
 
 # --- Diagnostic Report ---
 print(f"\n{BLUE}=========================================={RESET}")
 print(f"{BLUE}           DIAGNOSTIC REPORT              {RESET}")
 print(f"{BLUE}=========================================={RESET}")
 
-# 1. SMART Health Evaluation
 if "Verified" in smart_status:
     print(f"• Hardware Health (SMART): {GREEN}[GOOD] Verified (No failure detected){RESET}")
 elif "Not Supported" in smart_status:
-    print(f"• Hardware Health (SMART): {YELLOW}[INFO] Not supported on this connection type (common for external USB drives){RESET}")
+    print(f"• Hardware Health (SMART): {YELLOW}[INFO] Not supported on this connection type{RESET}")
 else:
     print(f"• Hardware Health (SMART): {RED}[BAD] {smart_status} - Immediate backup recommended!{RESET}")
 
-# 2. File System Evaluation
-if "appears to be OK" in verify_output:
+if not still_corrupted:
     print(f"• File System Structure:   {GREEN}[GOOD] Volume structure is healthy{RESET}")
 else:
-    print(f"• File System Structure:   {RED}[BAD] Potential corruption detected{RESET}")
+    print(f"• File System Structure:   {RED}[CRITICAL] Unresolved corruption persists.{RESET}")
+    print(f"{YELLOW}  -> Recommendation: If Option 2 (Deep Fix) and Option 1 failed, copy your files via Read-Only mount (Option 3) and reformat (Option 5).{RESET}")
 
-# 3. Performance Evaluation
-if mount_point and mount_point != "Not Mounted":
+if mount_point and mount_point != "Not Mounted" and write_mb_s > 0:
     is_ssd = "PCI" in protocol or "Solid" in media_name or "SSD" in media_name or "Apple Internal" in media_name or write_mb_s > 150
-    
     if is_ssd:
         if write_mb_s >= 500:
-            print(f"• Performance (SSD):       {GREEN}[EXCELLENT] Speeds match high-performance SSD standards{RESET}")
-        elif write_mb_s >= 200:
-            print(f"• Performance (SSD):       {GREEN}[GOOD] Normal performance for standard SSD{RESET}")
+            print(f"• Performance (SSD):       {GREEN}[EXCELLENT] High-performance speeds{RESET}")
         else:
-            print(f"• Performance (SSD):       {YELLOW}[WARNING] Speed is low for an SSD. Check cable, hub, or port type (e.g., USB 2.0 bottleneck){RESET}")
+            print(f"• Performance (SSD):       {YELLOW}[WARNING] Lower than expected speed (check ports/cables){RESET}")
     else:
         if write_mb_s >= 80:
-            print(f"• Performance (HDD):       {GREEN}[GOOD] Normal speed for a mechanical hard drive{RESET}")
+            print(f"• Performance (HDD):       {GREEN}[GOOD] Normal mechanical drive speed{RESET}")
         else:
-            print(f"• Performance (HDD):       {YELLOW}[WARNING] Drive is running slower than expected{RESET}")
+            print(f"• Performance (HDD):       {YELLOW}[WARNING] Drive running slow{RESET}")
 
 print(f"{BLUE}=========================================={RESET}")
 EOF
