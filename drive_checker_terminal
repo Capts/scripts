@@ -1,0 +1,160 @@
+python3 - << 'EOF'
+import os
+import subprocess
+import time
+import sys
+import re
+
+# ANSI Color Codes
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+BLUE = '\033[94m'
+CYAN = '\033[96m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
+
+def run_cmd(cmd):
+    result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+    return result.stdout.strip()
+
+def get_tty_input(prompt):
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    with open('/dev/tty', 'r') as tty:
+        return tty.readline().strip()
+
+print(f"{BLUE}=========================================={RESET}")
+print(f"{BLUE}    Advanced Mac Drive Diagnostic Tool    {RESET}")
+print(f"{BLUE}=========================================={RESET}")
+
+print(f"\n{CYAN}[Available Disks & Partitions]{RESET}")
+subprocess.run(["diskutil", "list"])
+
+print(f"\n{YELLOW}------------------------------------------{RESET}")
+target = get_tty_input("Enter the disk identifier to test (e.g., disk1s1, disk2): ")
+
+if not target:
+    print(f"{RED}No disk entered. Exiting.{RESET}")
+    exit(1)
+
+print(f"\n{CYAN}[1/3] Checking Drive Info & Health for {target}...{RESET}")
+info_output = run_cmd(f"diskutil info {target}")
+print(info_output)
+
+print(f"\n{CYAN}[2/3] Verifying File System for {target}...{RESET}")
+verify_output = run_cmd(f"diskutil verifyVolume {target}")
+print(verify_output)
+
+# Extract details for diagnostics
+smart_status = "Unknown"
+protocol = "Unknown"
+media_name = "Unknown"
+mount_point = None
+
+for line in info_output.split('\n'):
+    if "SMART Status" in line:
+        smart_status = line.split(":", 1)[1].strip()
+    elif "Protocol" in line:
+        protocol = line.split(":", 1)[1].strip()
+    elif "Media Name" in line:
+        media_name = line.split(":", 1)[1].strip()
+    elif "Mount Point" in line:
+        parts = line.split(":", 1)
+        if len(parts) > 1:
+            mount_point = parts[1].strip()
+
+write_mb_s = 0.0
+read_mb_s = 0.0
+
+if not mount_point or mount_point == "Not Mounted":
+    print(f"\n{YELLOW}[3/3] Warning: Target is not mounted. Skipping speed test.{RESET}")
+else:
+    print(f"\n{CYAN}[3/3] Running Blackmagic-Style Speed Test on [{mount_point}]...{RESET}")
+    test_file = os.path.join(mount_point, "python_speed_test.tmp")
+    
+    block_size = 1024 * 1024  # 1 MB blocks
+    total_size = 1024 * block_size  # 1 GB total
+    chunk = b'\0' * block_size
+
+    # Write Test
+    print("Writing 1GB temporary file...")
+    start_time = time.perf_counter()
+    try:
+        with open(test_file, "wb") as f:
+            bytes_written = 0
+            while bytes_written < total_size:
+                f.write(chunk)
+                bytes_written += block_size
+            f.flush()
+            os.fsync(f.fileno())
+        end_time = time.perf_counter()
+        
+        duration = end_time - start_time
+        write_mb_s = (total_size / (1024 * 1024)) / duration
+        print(f"--> Write Speed: {GREEN}{write_mb_s:.2f} MB/s{RESET}")
+    except Exception as e:
+        print(f"{RED}Write error: {e}{RESET}")
+        if os.path.exists(test_file):
+            os.remove(test_file)
+        exit(1)
+
+    # Read Test
+    print("Reading 1GB temporary file...")
+    start_time = time.perf_counter()
+    try:
+        with open(test_file, "rb") as f:
+            while True:
+                data = f.read(block_size)
+                if not data:
+                    break
+        end_time = time.perf_counter()
+        
+        duration = end_time - start_time
+        read_mb_s = (total_size / (1024 * 1024)) / duration
+        print(f"--> Read Speed:  {GREEN}{read_mb_s:.2f} MB/s{RESET}")
+    except Exception as e:
+        print(f"{RED}Read error: {e}{RESET}")
+
+    # Cleanup
+    if os.path.exists(test_file):
+        os.remove(test_file)
+
+# --- Diagnostic Report ---
+print(f"\n{BLUE}=========================================={RESET}")
+print(f"{BLUE}           DIAGNOSTIC REPORT              {RESET}")
+print(f"{BLUE}=========================================={RESET}")
+
+# 1. SMART Health Evaluation
+if "Verified" in smart_status:
+    print(f"• Hardware Health (SMART): {GREEN}[GOOD] Verified (No failure detected){RESET}")
+elif "Not Supported" in smart_status:
+    print(f"• Hardware Health (SMART): {YELLOW}[INFO] Not supported on this connection type (common for external USB drives){RESET}")
+else:
+    print(f"• Hardware Health (SMART): {RED}[BAD] {smart_status} - Immediate backup recommended!{RESET}")
+
+# 2. File System Evaluation
+if "appears to be OK" in verify_output:
+    print(f"• File System Structure:   {GREEN}[GOOD] Volume structure is healthy{RESET}")
+else:
+    print(f"• File System Structure:   {RED}[BAD] Potential corruption detected{RESET}")
+
+# 3. Performance Evaluation
+if mount_point and mount_point != "Not Mounted":
+    is_ssd = "PCI" in protocol or "Solid" in media_name or "SSD" in media_name or "Apple Internal" in media_name or write_mb_s > 150
+    
+    if is_ssd:
+        if write_mb_s >= 500:
+            print(f"• Performance (SSD):       {GREEN}[EXCELLENT] Speeds match high-performance SSD standards{RESET}")
+        elif write_mb_s >= 200:
+            print(f"• Performance (SSD):       {GREEN}[GOOD] Normal performance for standard SSD{RESET}")
+        else:
+            print(f"• Performance (SSD):       {YELLOW}[WARNING] Speed is low for an SSD. Check cable, hub, or port type (e.g., USB 2.0 bottleneck){RESET}")
+    else:
+        if write_mb_s >= 80:
+            print(f"• Performance (HDD):       {GREEN}[GOOD] Normal speed for a mechanical hard drive{RESET}")
+        else:
+            print(f"• Performance (HDD):       {YELLOW}[WARNING] Drive is running slower than expected{RESET}")
+
+print(f"{BLUE}=========================================={RESET}")
+EOF
