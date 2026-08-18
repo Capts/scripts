@@ -1,282 +1,481 @@
-python3 - << 'EOF'
-import os
-import subprocess
-import time
-import sys
-from datetime import datetime
+sudo python3 - << 'EOF'
+import os, sys, time, socket, struct, select, ipaddress, subprocess, json, argparse, re
 
-# ANSI Color Codes
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-BLUE = '\033[94m'
-CYAN = '\033[96m'
-RESET = '\033[0m'
-BOLD = '\033[1m'
+# --- COLOR DEFINITIONS ---
+GREEN, RED, YELLOW, CYAN, BOLD, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[96m", "\033[1m", "\033[0m"
 
-def run_cmd(cmd):
-    result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
-    return result.stdout.strip()
+OUI_DB = {
+    "02:42": "Docker Virtual Veth Container", "00:50:56": "VMware Virtual NIC",
+    "00:0c:29": "VMware Virtual NIC", "08:00:27": "Oracle VirtualBox",
+    "52:54:00": "QEMU/KVM Virtual NIC", "b8:27:eb": "Raspberry Pi Foundation",
+    "dc:a6:32": "Raspberry Pi Foundation", "e4:5f:01": "Raspberry Pi Foundation",
+    "f4:6d:e2": "Ubiquiti Networks", "e8:65:d4": "TP-Link"
+}
+
+def get_vendor(mac):
+    mac_clean = mac.lower().replace("-", ":")
+    return OUI_DB.get(mac_clean[:5], OUI_DB.get(mac_clean[:8], "Unknown / Physical Device"))
 
 def get_tty_input(prompt):
-    sys.stdout.write(prompt)
-    sys.stdout.flush()
-    with open('/dev/tty', 'r') as tty:
-        return tty.readline().strip()
+    try:
+        with open("/dev/tty", "r") as tty:
+            print(prompt, end="", flush=True)
+            return tty.readline().strip()
+    except Exception:
+        try:
+            return input(prompt).strip()
+        except Exception:
+            return ""
 
-def get_valid_input(prompt, max_retries=3):
-    """Loops until user enters text. Returns None if max empty tries are reached."""
-    attempts = 0
-    while attempts < max_retries:
-        val = get_tty_input(prompt)
-        if val:
-            return val
-        attempts += 1
-        remaining = max_retries - attempts
-        if remaining > 0:
-            print(f"{RED}[!] Input cannot be blank. {remaining} empty attempt(s) left before returning to menu.{RESET}")
-        else:
-            print(f"\n{RED}[!] Too many blank inputs. Returning to main menu...{RESET}")
-            return None
-    return None
+def backup_file(filepath):
+    if os.path.exists(filepath):
+        ts = int(time.time())
+        bak_path = f"{filepath}.bak.{ts}"
+        try:
+            with open(filepath, "r") as src, open(bak_path, "w") as dst:
+                dst.write(src.read())
+            print(f"  {CYAN}[i] Backup created: {bak_path}{RESET}")
+        except Exception as e:
+            print(f"  {YELLOW}[!] Failed to create backup for {filepath}: {e}{RESET}")
 
-def show_disk_list():
-    print(f"\n{CYAN}[Available Disks & Partitions]{RESET}")
-    subprocess.run(["diskutil", "list"])
+class RawARPProber:
+    def __init__(self, interface, src_ip, src_mac):
+        self.iface = interface
+        self.src_ip = src_ip
+        self.src_mac = src_mac
+        self.src_mac_bytes = bytes.fromhex(src_mac.replace(":", ""))
+        self.src_ip_bytes = socket.inet_aton(src_ip)
 
-while True:
-    print(f"\n{BLUE}=================================================={RESET}")
-    print(f"{BLUE}   macOS Ultimate Drive Diagnostic & Repair Pro   {RESET}")
-    print(f"{BLUE}=================================================={RESET}")
-    print("  [1] Full Diagnostic Suite (Health + Repair + Speed Test)")
-    print("  [2] Quick Speed Benchmark Only (1GB Read/Write Test)")
-    print("  [3] File System Repair Tool (Fix Exit Code 8, Superblock)")
-    print("  [4] Emergency Read-Only Mount (For pulling files off bad drives)")
-    print("  [5] Smart Hardware Attribute Dump (View deep hardware stats)")
-    print("  [6] Erase and Reformat Partition (Wipe specific volume)")
-    print("  [7] Reformat & Unify Whole Disk (Erase parent disk into 1 volume)")
-    print("  [8] Sector-by-Sector Clone / Backup (Copy source to destination)")
-    print("  [9] Exit")
-    print(f"{BLUE}=================================================={RESET}")
+    @staticmethod
+    def bytes_to_mac(mac_bytes):
+        return ":".join(f"{b:02x}" for b in mac_bytes)
+
+    def create_arp_packet(self, target_ip, op=1):
+        target_ip_bytes = socket.inet_aton(target_ip)
+        eth_hdr = struct.pack("!6s6sH", b"\xff\xff\xff\xff\xff\xff", self.src_mac_bytes, 0x0806)
+        arp_hdr = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, op, self.src_mac_bytes, self.src_ip_bytes, b"\x00"*6, target_ip_bytes)
+        return eth_hdr + arp_hdr
+
+    def probe_ip(self, target_ip, timeout=0.8):
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+            sock.bind((self.iface, 0))
+            sock.setblocking(False)
+        except Exception: 
+            return []
+
+        try:
+            sock.send(self.create_arp_packet(target_ip))
+        except Exception:
+            sock.close()
+            return []
+
+        responses = []
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            r, _, _ = select.select([sock], [], [], 0.05)
+            if r:
+                try:
+                    data = sock.recv(2048)
+                    if len(data) >= 42 and struct.unpack("!H", data[12:14])[0] == 0x0806:
+                        opcode, sender_mac_b, sender_ip_b = struct.unpack("!H6s4s", data[20:32])
+                        if socket.inet_ntoa(sender_ip_b) == target_ip and opcode == 2:
+                            mac = self.bytes_to_mac(sender_mac_b)
+                            if mac not in responses: 
+                                responses.append(mac)
+                except Exception: 
+                    pass
+        sock.close()
+        return responses
+
+# --- PROXMOX / VIRTUALIZATION CHECKS ---
+
+def find_proxmox_mac_owner(target_mac):
+    pve_paths = ["/etc/pve/qemu-server", "/etc/pve/lxc"]
+    target_mac = target_mac.lower()
+    matches = []
     
-    choice = get_tty_input("Select an option (1-9): ")
+    for path in pve_paths:
+        if os.path.exists(path):
+            for fname in os.listdir(path):
+                if fname.endswith(".conf"):
+                    vmid = fname.split(".")[0]
+                    vtype = "LXC" if "lxc" in path else "VM"
+                    cpath = os.path.join(path, fname)
+                    try:
+                        with open(cpath, "r") as f:
+                            for line in f:
+                                if target_mac in line.lower():
+                                    matches.append(f"{vtype} {vmid}")
+                    except Exception:
+                        pass
+    return ", ".join(matches) if matches else None
+
+# --- HEALTH & DIAGNOSTIC CHECKS ---
+
+def check_wan_and_dns(gateway_ip):
+    results = {"gw_ping": False, "dns_public": False, "dns_system": False}
     
-    if choice == '9':
-        print("Exiting tool. Goodbye!")
-        break
-        
-    if choice in ['1', '2', '3', '4', '5', '6', '7', '8']:
-        show_disk_list()
-        print(f"\n{YELLOW}--------------------------------------------------{RESET}")
-        
-        target = None
-        source = None
-        dest = None
+    res = subprocess.run(["ping", "-c", "1", "-W", "1", gateway_ip], capture_output=True)
+    results["gw_ping"] = (res.returncode == 0)
 
-        if choice == '7':
-            target = get_valid_input("Enter parent disk identifier to unify (e.g., disk4): ")
-        elif choice == '8':
-            source = get_valid_input("Enter SOURCE disk/partition to clone (e.g., disk2s1): ")
-            if source:
-                dest = get_valid_input("Enter DESTINATION disk/partition (WARNING: WILL BE ERASED) (e.g., disk3s1): ")
-            target = source # placeholder for logging
-        else:
-            target = get_valid_input("Enter target partition identifier (e.g., disk4s1): ")
+    try:
+        socket.setdefaulttimeout(1.5)
+        socket.gethostbyname_ex("one.one.one.one")
+        results["dns_public"] = True
+    except Exception:
+        results["dns_public"] = False
 
-        # If any required input timed out / hit 3 blank tries, abort and loop back to menu
-        if not target or (choice == '8' and not dest):
+    try:
+        socket.getaddrinfo("google.com", 80)
+        results["dns_system"] = True
+    except Exception:
+        results["dns_system"] = False
+
+    return results
+
+def find_free_ips(iface, base_ip, prober, count=3):
+    print(f"\n{CYAN}[*] Scanning local subnet for unused static IP candidates...{RESET}")
+    net = ipaddress.ip_network(f"{base_ip}/24", strict=False)
+    free_ips = []
+    for ip in net.hosts():
+        ip_str = str(ip)
+        if ip_str == base_ip:
             continue
+        res = prober.probe_ip(ip_str, timeout=0.2)
+        if not res:
+            free_ips.append(ip_str)
+            if len(free_ips) >= count:
+                break
+    return free_ips
 
-        # --- OPTION 1: FULL DIAGNOSTIC SUITE ---
-        if choice == '1':
-            print(f"\n{CYAN}[1/3] Checking Drive Info & Health for {target}...{RESET}")
-            info_output = run_cmd(f"diskutil info {target}")
-            print(info_output)
+# --- ROGUE ARP CAPTURE ENGINE ---
 
-            is_whole_disk = "Whole: Yes" in info_output or not "s" in target
+def start_rogue_arp_sniffer(iface, my_ip, my_mac, gw_ip, known_gw_macs):
+    print(f"\n{BOLD}{CYAN}=== LIVE ROGUE ARP DETECTOR & PACKET CAPTURE ==={RESET}")
+    print(f" [*] Listening on {BOLD}{iface}{RESET} for suspicious ARP activity...")
+    print(f" [*] Monitoring for: IP spoofing of {my_ip}, Gateway poisoning of {gw_ip}")
+    print(f" {YELLOW}[!] Press Ctrl+C to stop sniffing and exit back to menu.{RESET}\n")
 
-            if is_whole_disk:
-                print(f"\n{YELLOW}[!] Note: '{target}' is a whole physical disk container, not a mountable partition slice.{RESET}")
-                print(f"{YELLOW}Skipping volume file-system checks (use option [7] to unify/format).{RESET}")
-            else:
-                print(f"\n{CYAN}[2/3] Verifying File System for {target}...{RESET}")
-                verify_output = run_cmd(f"diskutil verifyVolume {target}")
-                print(verify_output)
+    log_file = "/var/log/rogue_arp_alerts.log"
 
-                if "appears to be OK" not in verify_output:
-                    print(f"\n{RED}[!] Corruption detected. Running automated repair sequence...{RESET}")
-                    subprocess.run(["diskutil", "repairVolume", target])
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+        sock.bind((iface, 0))
+    except Exception as e:
+        print(f"{RED}[!] Failed to bind raw socket: {e}{RESET}")
+        return
 
-            mount_point = None
-            for line in info_output.split('\n'):
-                if "Mount Point" in line:
-                    parts = line.split(":", 1)
-                    if len(parts) > 1:
-                        mount_point = parts[1].strip()
+    detected_alerts = 0
 
-            if (not mount_point or mount_point == "Not Mounted") and not is_whole_disk:
-                print(f"{YELLOW}[!] Target unmounted. Attempting mount...{RESET}")
-                subprocess.run(["diskutil", "mount", target])
-                info_output = run_cmd(f"diskutil info {target}")
-                for line in info_output.split('\n'):
-                    if "Mount Point" in line:
-                        parts = line.split(":", 1)
-                        if len(parts) > 1:
-                            mount_point = parts[1].strip()
+    try:
+        while True:
+            r, _, _ = select.select([sock], [], [], 0.5)
+            if r:
+                data = sock.recv(2048)
+                if len(data) < 42:
+                    continue
 
-            if mount_point and mount_point != "Not Mounted":
-                print(f"\n{CYAN}[3/3] Running Blackmagic-Style Speed Test on [{mount_point}]...{RESET}")
-                test_file = os.path.join(mount_point, "python_speed_test.tmp")
-                block_size = 1024 * 1024
-                chunk = b'\0' * block_size
+                # Unpack Ethernet & ARP Headers
+                eth_hdr = data[:14]
+                arp_hdr = data[14:42]
+                
+                eth_type = struct.unpack("!H", eth_hdr[12:14])[0]
+                if eth_type != 0x0806:
+                    continue
 
-                start_time = time.perf_counter()
-                with open(test_file, "wb") as f:
-                    for _ in range(1024):
-                        f.write(chunk)
-                    f.flush()
-                    os.fsync(f.fileno())
-                write_mb = 1024 / (time.perf_counter() - start_time)
-                print(f"--> Write Speed: {GREEN}{write_mb:.2f} MB/s{RESET}")
+                hardware_type, protocol_type, mac_len, ip_len, opcode, sender_mac_b, sender_ip_b, target_mac_b, target_ip_b = struct.unpack("!HHBBH6s4s6s4s", arp_hdr)
 
-                start_time = time.perf_counter()
-                with open(test_file, "rb") as f:
-                    while f.read(block_size):
+                sender_mac = RawARPProber.bytes_to_mac(sender_mac_b)
+                sender_ip = socket.inet_ntoa(sender_ip_b)
+                target_ip = socket.inet_ntoa(target_ip_b)
+
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                anomaly = None
+
+                # Anomaly 1: Attacker claiming OUR IP address
+                if sender_ip == my_ip and sender_mac.lower() != my_mac.lower():
+                    anomaly = f"IP SPOOFING ATTEMPT! Device claiming local IP {my_ip}"
+
+                # Anomaly 2: Rogue Gateway ARP Poisoning / Gratuitous ARP
+                elif sender_ip == gw_ip and known_gw_macs and sender_mac.lower() not in [m.lower() for m in known_gw_macs]:
+                    anomaly = f"ROGUE GATEWAY POISONING! Device claiming Gateway IP {gw_ip}"
+
+                if anomaly:
+                    detected_alerts += 1
+                    vendor = get_vendor(sender_mac)
+                    pve_owner = find_proxmox_mac_owner(sender_mac)
+                    pve_str = f" [Proxmox: {pve_owner}]" if pve_owner else ""
+
+                    alert_msg = f"[{timestamp}] {BOLD}{RED}ALERT #{detected_alerts}:{RESET} {anomaly}\n" \
+                                f"   ↳ Attacker MAC    : {RED}{sender_mac}{RESET} ({vendor}){pve_str}\n" \
+                                f"   ↳ Target IP       : {target_ip}\n" \
+                                f"   ↳ ARP Opcode      : {'REQUEST' if opcode == 1 else 'REPLY'}"
+
+                    print(alert_msg)
+
+                    # Log to file
+                    try:
+                        with open(log_file, "a") as f:
+                            f.write(f"[{timestamp}] ALERT: {anomaly} | MAC: {sender_mac} ({vendor}) | Target: {target_ip}\n")
+                    except Exception:
                         pass
-                read_mb = 1024 / (time.perf_counter() - start_time)
-                print(f"--> Read Speed:  {GREEN}{read_mb:.2f} MB/s{RESET}")
-                
-                if os.path.exists(test_file):
-                    os.remove(test_file)
-                    
-                save_report = get_tty_input("\nWould you like to save this diagnostic report to your Desktop? (y/n): ")
-                if save_report.lower() == 'y':
-                    desktop_path = os.path.expanduser("~/Desktop")
-                    report_file = os.path.join(desktop_path, f"Drive_Report_{target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-                    with open(report_file, "w") as rep:
-                        rep.write(f"=== macOS Drive Diagnostic Report ===\nTarget: {target}\nDate: {datetime.now()}\n\n{info_output}\n\nWrite Speed: {write_mb:.2f} MB/s\nRead Speed: {read_mb:.2f} MB/s")
-                    print(f"{GREEN}Report saved successfully to: {report_file}{RESET}")
+
+    except KeyboardInterrupt:
+        print(f"\n\n{GREEN}[✓] Sniffer stopped. Captured {detected_alerts} rogue ARP alert(s).{RESET}")
+        if detected_alerts > 0:
+            print(f" {CYAN}[i] Logs saved to {log_file}{RESET}")
+    finally:
+        sock.close()
+
+# --- REMEDIATION / FIX FUNCTIONS ---
+
+def fix_flush_arp(iface):
+    print(f"\n{CYAN}[+] Action: Flushing ARP and Neighbor Cache on {iface}...{RESET}")
+    res = subprocess.run(["ip", "neighbor", "flush", "dev", iface], capture_output=True, text=True)
+    if res.returncode == 0:
+        print(f"  {GREEN}[✓] ARP cache successfully flushed.{RESET}")
+    else:
+        print(f"  {RED}[!] Failed to flush ARP cache: {res.stderr.strip()}{RESET}")
+
+def fix_renew_dhcp(iface):
+    print(f"\n{CYAN}[+] Action: Reacquiring DHCP Lease / Resetting Interface...{RESET}")
+    res = subprocess.run(f"dhclient -r {iface} && dhclient {iface}", shell=True, capture_output=True, text=True)
+    if res.returncode != 0:
+        res = subprocess.run("systemctl restart NetworkManager 2>/dev/null || systemctl restart networking 2>/dev/null", shell=True, capture_output=True, text=True)
+    print(f"  {GREEN}[✓] Network interface restarted / DHCP reacquired.{RESET}")
+
+def fix_enable_ip_forwarding():
+    print(f"\n{CYAN}[+] Action: Enabling IPv4 Kernel Forwarding...{RESET}")
+    subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], capture_output=True)
+    
+    sysctl_file = "/etc/sysctl.conf"
+    backup_file(sysctl_file)
+    try:
+        content = ""
+        if os.path.exists(sysctl_file):
+            with open(sysctl_file, "r") as f:
+                content = f.read()
+
+        if "net.ipv4.ip_forward=1" not in content:
+            if "net.ipv4.ip_forward" in content:
+                lines = [line if not line.startswith("net.ipv4.ip_forward") else "net.ipv4.ip_forward=1" for line in content.splitlines()]
+                with open(sysctl_file, "w") as f:
+                    f.write("\n".join(lines) + "\n")
             else:
-                print(f"{RED}[!] Cannot run speed test because target has no mounted file system volume.{RESET}")
+                with open(sysctl_file, "a") as f:
+                    f.write("\nnet.ipv4.ip_forward=1\n")
+        
+        subprocess.run(["sysctl", "-p"], capture_output=True)
+        print(f"  {GREEN}[✓] IPv4 Forwarding enabled and set to persistent in {sysctl_file}.{RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}[!] Enabled for current session, but failed to persist: {e}{RESET}")
 
-        # --- OPTION 2: QUICK SPEED BENCHMARK ---
-        elif choice == '2':
-            info_output = run_cmd(f"diskutil info {target}")
-            mount_point = None
-            for line in info_output.split('\n'):
-                if "Mount Point" in line:
-                    parts = line.split(":", 1)
-                    if len(parts) > 1:
-                        mount_point = parts[1].strip()
-            
-            if not mount_point or mount_point == "Not Mounted":
-                print(f"{YELLOW}Drive unmounted. Attempting auto-mount...{RESET}")
-                subprocess.run(["diskutil", "mount", target])
-                info_output = run_cmd(f"diskutil info {target}")
-                for line in info_output.split('\n'):
-                    if "Mount Point" in line:
-                        parts = line.split(":", 1)
-                        if len(parts) > 1:
-                            mount_point = parts[1].strip()
+def fix_docker_subnets():
+    print(f"\n{CYAN}[+] Action: Reconfiguring Docker Default Subnet Pool...{RESET}")
+    daemon_path = "/etc/docker/daemon.json"
+    backup_file(daemon_path)
+    cfg = {}
+    if os.path.exists(daemon_path):
+        try:
+            with open(daemon_path, "r") as f: 
+                cfg = json.load(f)
+        except Exception: 
+            cfg = {}
 
-            if mount_point and mount_point != "Not Mounted":
-                print(f"\n{CYAN}Running Quick Benchmark on {mount_point}...{RESET}")
-                test_file = os.path.join(mount_point, "quick_bench.tmp")
-                chunk = b'\0' * (1024 * 1024)
-                
-                start = time.perf_counter()
-                with open(test_file, "wb") as f:
-                    for _ in range(512):
-                        f.write(chunk)
-                    f.flush()
-                    os.fsync(f.fileno())
-                w_speed = 512 / (time.perf_counter() - start)
-                
-                start = time.perf_counter()
-                with open(test_file, "rb") as f:
-                    while f.read(1024 * 1024):
-                        pass
-                r_speed = 512 / (time.perf_counter() - start)
-                
-                if os.path.exists(test_file):
-                    os.remove(test_file)
-                    
-                print(f"--> Quick Write: {GREEN}{w_speed:.2f} MB/s{RESET}")
-                print(f"--> Quick Read:  {GREEN}{r_speed:.2f} MB/s{RESET}")
+    cfg["default-address-pools"] = [{"base": "172.18.0.0/16", "size": 24}]
+    
+    try:
+        os.makedirs("/etc/docker", exist_ok=True)
+        with open(daemon_path, "w") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"  {GREEN}[✓] Updated {daemon_path} with pool 172.18.0.0/16.{RESET}")
+        print(f"  [*] Restarting Docker service...")
+        subprocess.run(["systemctl", "restart", "docker"], capture_output=True)
+        print(f"  {GREEN}[✓] Docker restarted successfully.{RESET}")
+    except Exception as e:
+        print(f"  {RED}[!] Failed to update Docker daemon configuration: {e}{RESET}")
+
+def fix_lock_gateway_arp(iface, gw_ip, gw_mac):
+    print(f"\n{CYAN}[+] Action: Binding Static ARP for Gateway {gw_ip} -> {gw_mac}...{RESET}")
+    cmd = ["ip", "neighbor", "replace", gw_ip, "lladdr", gw_mac, "dev", iface, "nud", "permanent"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        print(f"  {GREEN}[✓] Static ARP entry locked permanently for Gateway.{RESET}")
+    else:
+        print(f"  {RED}[!] Failed to set static ARP: {res.stderr.strip()}{RESET}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Network Diagnostic & Repair Tool")
+    parser.add_argument("--auto-fix", action="store_true", help="Automatically apply all recommended fixes non-interactively")
+    parser.add_argument("--json", action="store_true", help="Output audit results in JSON format and exit")
+    parser.add_argument("--scan-free-ips", action="store_true", help="Scan for available unused IPs on subnet and exit")
+    parser.add_argument("--sniff-rogue-arp", action="store_true", help="Launch live Rogue ARP sniffer non-interactively")
+    args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        print(f"{RED}[!] Must be run as root (sudo).{RESET}")
+        sys.exit(1)
+
+    import fcntl
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    try:
+        with open("/proc/net/route") as f: 
+            routes = f.readlines()[1:]
+    except Exception as e:
+        print(f"{RED}[!] Error reading routing table: {e}{RESET}")
+        sys.exit(1)
+
+    def_iface, def_gw = None, None
+    for r in routes:
+        p = r.strip().split()
+        if len(p) >= 3 and p[1] == "00000000":
+            def_iface = p[0]
+            gw_hex = int(p[2], 16)
+            def_gw = socket.inet_ntoa(struct.pack("<L", gw_hex))
+            break
+
+    if not def_iface:
+        print(f"{RED}[!] No default network route found.{RESET}")
+        sys.exit(1)
+
+    try:
+        my_ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", def_iface[:15].encode("utf-8")))[20:24])
+        with open(f"/sys/class/net/{def_iface}/address") as f: 
+            my_mac = f.read().strip()
+    except Exception as e:
+        print(f"{RED}[!] Could not retrieve IP/MAC for interface {def_iface}: {e}{RESET}")
+        sys.exit(1)
+
+    prober = RawARPProber(def_iface, my_ip, my_mac)
+
+    if args.scan_free_ips:
+        free_ips = find_free_ips(def_iface, my_ip, prober, count=5)
+        print(f"\n{GREEN}[✓] Suggested Free Static IPs:{RESET} {', '.join(free_ips)}\n")
+        sys.exit(0)
+
+    gw_responses = prober.probe_ip(def_gw, 0.8)
+
+    if args.sniff_rogue_arp:
+        start_rogue_arp_sniffer(def_iface, my_ip, my_mac, def_gw, gw_responses)
+        sys.exit(0)
+
+    ip_responses = prober.probe_ip(my_ip, 0.8)
+
+    ip_conflict_macs = [m for m in ip_responses if m.lower() != my_mac.lower()]
+    ip_conflict = len(ip_conflict_macs) > 0
+    gw_conflict = len(gw_responses) > 1
+
+    fwd_enabled = True
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward") as f:
+            fwd_enabled = f.read().strip() == "1"
+    except Exception: 
+        pass
+
+    wan_health = check_wan_and_dns(def_gw)
+
+    if args.json:
+        output = {
+            "interface": def_iface, "ip": my_ip, "mac": my_mac, "gateway": def_gw,
+            "ip_conflict": ip_conflict, "gateway_collision": gw_conflict,
+            "kernel_forwarding": fwd_enabled, "wan_health": wan_health,
+            "ip_conflict_macs": ip_conflict_macs, "gateway_macs": gw_responses
+        }
+        print(json.dumps(output, indent=2))
+        sys.exit(0)
+
+    print(f"\n{BOLD}{CYAN}=== DEEP DIAGNOSTIC & AUTOMATED RESOLUTION TOOL ==={RESET}")
+    print(f"\n{BOLD}[+] Interface:{RESET} {def_iface} | {BOLD}IP:{RESET} {my_ip} | {BOLD}MAC:{RESET} {my_mac} ({get_vendor(my_mac)}) | {BOLD}Gateway:{RESET} {def_gw}")
+
+    print(f"\n{BOLD}{CYAN}=== AUDIT SUMMARY ==={RESET}")
+    print(f" • IP Conflict Detected      : {RED if ip_conflict else GREEN}{'YES' if ip_conflict else 'NO'}{RESET}")
+    if ip_conflict:
+        for m in ip_conflict_macs:
+            pve_owner = find_proxmox_mac_owner(m)
+            pve_str = f" [Proxmox: {pve_owner}]" if pve_owner else ""
+            print(f"   ↳ Conflicting MAC : {RED}{m}{RESET} ({get_vendor(m)}){pve_str}")
+
+    print(f" • Gateway Collision         : {RED if gw_conflict else GREEN}{'YES' if gw_conflict else 'NO'}{RESET}")
+    if gw_conflict:
+        for m in gw_responses:
+            pve_owner = find_proxmox_mac_owner(m)
+            pve_str = f" [Proxmox: {pve_owner}]" if pve_owner else ""
+            print(f"   ↳ Responder MAC   : {YELLOW}{m}{RESET} ({get_vendor(m)}){pve_str}")
+
+    print(f" • Kernel Forwarding Enabled : {GREEN if fwd_enabled else RED}{'YES' if fwd_enabled else 'NO (Issue for containers)'}{RESET}")
+    print(f" • Gateway Ping Reachable   : {GREEN if wan_health['gw_ping'] else RED}{'YES' if wan_health['gw_ping'] else 'NO'}{RESET}")
+    print(f" • Public DNS Resolution     : {GREEN if wan_health['dns_public'] else RED}{'YES' if wan_health['dns_public'] else 'NO'}{RESET}")
+    print(f" • System DNS Resolution     : {GREEN if wan_health['dns_system'] else RED}{'YES' if wan_health['dns_system'] else 'NO'}{RESET}")
+
+    has_issues = ip_conflict or gw_conflict or not fwd_enabled or not wan_health['dns_system']
+
+    if args.auto_fix:
+        print(f"\n{YELLOW}[*] Executing --auto-fix mode...{RESET}")
+        fix_flush_arp(def_iface)
+        fix_renew_dhcp(def_iface)
+        fix_docker_subnets()
+        fix_enable_ip_forwarding()
+        sys.exit(0)
+
+    while True:
+        print(f"\n{BOLD}{CYAN}=== REMEDIATION & FIX MENU ==={RESET}")
+        print(" [1] Flush ARP / Neighbor Cache")
+        print(" [2] Renew DHCP Lease / Reset Interface")
+        print(" [3] Fix Docker Subnet Overlaps (Reconfigure daemon.json to 172.18.0.0/16)")
+        print(" [4] Enable IPv4 Kernel Forwarding")
+        print(" [5] Lock Gateway Static ARP Entry (Mitigate Gateway Poisoning)")
+        print(" [6] Scan Subnet for Free Static IP Candidates")
+        print(" [7] Apply ALL Standard Fixes (1-4)")
+        print(" [8] Start Live Rogue ARP Sniffer & Alert Engine")
+        print(" [0] Exit")
+
+        prompt_str = f"\n{BOLD}Select an action [0-8]" + (f" ({YELLOW}Recommended: 7{RESET}{BOLD})" if has_issues else "") + f": {RESET}"
+        choice = get_tty_input(prompt_str)
+
+        if choice == "1":
+            fix_flush_arp(def_iface)
+        elif choice == "2":
+            fix_renew_dhcp(def_iface)
+        elif choice == "3":
+            fix_docker_subnets()
+        elif choice == "4":
+            fix_enable_ip_forwarding()
+        elif choice == "5":
+            if gw_responses:
+                target_mac = gw_responses[0]
+                if len(gw_responses) > 1:
+                    print(f"\n{YELLOW}Multiple Gateway MACs detected:{RESET}")
+                    for idx, m in enumerate(gw_responses):
+                        print(f" [{idx+1}] {m} ({get_vendor(m)})")
+                    sel = get_tty_input("Select MAC to lock as legitimate gateway [1]: ")
+                    try:
+                        target_mac = gw_responses[int(sel)-1]
+                    except Exception:
+                        target_mac = gw_responses[0]
+                fix_lock_gateway_arp(def_iface, def_gw, target_mac)
             else:
-                print(f"{RED}Error: Drive could not be mounted for benchmarking.{RESET}")
+                print(f"{RED}[!] No MAC address available for Gateway.{RESET}")
+        elif choice == "6":
+            free_ips = find_free_ips(def_iface, my_ip, prober, count=5)
+            print(f"\n{GREEN}[✓] Suggested Free Static IPs:{RESET} {', '.join(free_ips)}")
+        elif choice == "7":
+            fix_flush_arp(def_iface)
+            fix_renew_dhcp(def_iface)
+            fix_docker_subnets()
+            fix_enable_ip_forwarding()
+            print(f"\n{GREEN}[✓] All standard fixes executed successfully.{RESET}")
+            break
+        elif choice == "8":
+            start_rogue_arp_sniffer(def_iface, my_ip, my_mac, def_gw, gw_responses)
+        elif choice == "0":
+            print(f"\n{GREEN}[+] Exiting tool. Goodbye!{RESET}\n")
+            break
+        else:
+            print(f"\n{RED}[!] Invalid choice. Try again.{RESET}")
 
-        # --- OPTION 3: ADVANCED FILE SYSTEM REPAIR ---
-        elif choice == '3':
-            print(f"\n{CYAN}Running deep file system repair on {target}...{RESET}")
-            subprocess.run(["diskutil", "unmount", "force", target])
-            info_output = run_cmd(f"diskutil info {target}")
-            fs_type = "hfs" if "HFS" in info_output else "apfs"
-            
-            print(f"Executing low-level fsck_{fs_type}...")
-            subprocess.run(f"sudo fsck_{fs_type} -y /dev/{target}", shell=True)
-            subprocess.run(["diskutil", "repairVolume", target])
-            subprocess.run(["diskutil", "mount", target])
-            print(f"{GREEN}Repair sequence completed.{RESET}")
-
-        # --- OPTION 4: EMERGENCY READ-ONLY MOUNT ---
-        elif choice == '4':
-            print(f"\n{CYAN}Forcing Read-Only mount for data recovery...{RESET}")
-            res = run_cmd(f"diskutil mount readOnly {target}")
-            print(res)
-            print(f"{GREEN}Check your Mac Desktop/Finder to copy your files immediately!{RESET}")
-
-        # --- OPTION 5: SMART ATTRIBUTE DUMP ---
-        elif choice == '5':
-            print(f"\n{CYAN}Fetching hardware stats for {target}...{RESET}")
-            res = run_cmd(f"diskutil info {target}")
-            print(res)
-
-        # --- OPTION 6: ERASE & REFORMAT PARTITION ---
-        elif choice == '6':
-            print(f"\n{RED}[WARNING] This will permanently erase partition {target}!{RESET}")
-            confirm = get_tty_input("Type 'YES' to proceed with formatting: ")
-            if confirm == 'YES':
-                new_name = get_valid_input("Enter new drive name: ")
-                if new_name:
-                    print(f"Formatting {target} to APFS...")
-                    subprocess.run(["diskutil", "eraseVolume", "APFS", new_name, target])
-                    print(f"{GREEN}Formatting complete!{RESET}")
-            else:
-                print("Formatting aborted.")
-
-        # --- OPTION 7: REFORMAT & UNIFY WHOLE DISK ---
-        elif choice == '7':
-            print(f"\n{RED}[WARNING] This will wipe ENTIRE physical disk '{target}' and merge it into 1 partition!{RESET}")
-            confirm = get_tty_input("Type 'YES' to confirm wiping the entire disk: ")
-            if confirm == 'YES':
-                new_name = get_valid_input("Enter a name for the unified drive: ")
-                if new_name:
-                    print(f"\nSelect File System Format:")
-                    print("  [1] APFS (Best for Mac-only use)")
-                    print("  [2] ExFAT (Best if used between Mac and Windows)")
-                    fmt_choice = get_tty_input("Enter choice (1-2, default is 1): ")
-                    file_system = "ExFAT" if fmt_choice == '2' else "APFS"
-                    
-                    print(f"\n{CYAN}Wiping and reformatting {target} into a single {file_system} volume...{RESET}")
-                    subprocess.run(["diskutil", "eraseDisk", file_system, new_name, target])
-                    print(f"{GREEN}Unified formatting complete!{RESET}")
-            else:
-                print("Operation cancelled.")
-
-        # --- OPTION 8: CLONE / BACKUP UTILITY ---
-        elif choice == '8':
-            print(f"\n{RED}[WARNING] Source: {source} -> Destination: {dest}{RESET}")
-            print(f"{RED}All data on the destination drive will be permanently overwritten!{RESET}")
-            confirm = get_tty_input("Type 'CLONE' to confirm the cloning process: ")
-            if confirm == 'CLONE':
-                print(f"\n{CYAN}Cloning partition data using Apple Software Restore (asr)...{RESET}")
-                clone_cmd = f"sudo asr restore --source /dev/{source} --target /dev/{dest} --erase --noprompt"
-                print(f"Executing: {clone_cmd}")
-                subprocess.run(clone_cmd, shell=True)
-                print(f"{GREEN}Cloning process finished.{RESET}")
-            else:
-                print("Cloning cancelled.")
-                
-        get_tty_input("\nPress [Enter] to return to the main menu...")
+if __name__ == "__main__":
+    main()
 EOF
