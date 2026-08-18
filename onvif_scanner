@@ -1,0 +1,91 @@
+python3 -c '
+import subprocess, sys, importlib.util, urllib.parse
+
+# 1. Dependency Check
+for mod, pkg in [("WSDiscovery", "WSDiscovery"), ("onvif", "onvif-zeep")]:
+    if importlib.util.find_spec(mod) is None:
+        print(f"Installing {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+
+from wsdiscovery.discovery import ThreadedWSDiscovery as WSDiscovery
+from onvif import ONVIFCamera
+
+# Configuration
+USER = "admin"
+PASS = "password123"
+
+# 2. Network Discovery
+wsd = WSDiscovery()
+wsd.start()
+print("Scanning local network for ONVIF devices (5s)...\n")
+services = wsd.searchServices(timeout=5)
+
+if not services:
+    print("No ONVIF devices found on the network.")
+    wsd.stop()
+    sys.exit()
+
+# 3. Parse Metadata & Authenticate
+for idx, service in enumerate(services, start=1):
+    xaddrs = service.getXAddrs()
+    scopes = service.getScopes()
+    
+    # Extract IP & Port
+    ip, port = "Unknown", "80"
+    if xaddrs:
+        parsed_url = urllib.parse.urlparse(xaddrs[0])
+        ip = parsed_url.hostname or "Unknown"
+        port = parsed_url.port or 80
+
+    # Parse Unauthenticated Scopes
+    device_name, model, hardware = "Unknown", "Unknown", "Unknown"
+    for scope in scopes:
+        s_val = str(scope)
+        if "name/" in s_val:
+            device_name = urllib.parse.unquote(s_val.split("name/")[-1])
+        elif "hardware/" in s_val:
+            hardware = urllib.parse.unquote(s_val.split("hardware/")[-1])
+        elif "model/" in s_val:
+            model = urllib.parse.unquote(s_val.split("model/")[-1])
+
+    # Resolving default display string without backslashes inside f-string
+    hw_display = hardware if hardware != "Unknown" else model
+    service_uri = xaddrs[0] if xaddrs else "N/A"
+
+    print("=" * 50)
+    print(f"Device #{idx}")
+    print("=" * 50)
+    print(f"  IP Address : {ip}")
+    print(f"  ONVIF Port : {port}")
+    print(f"  Name       : {device_name}")
+    print(f"  Hardware   : {hw_display}")
+    print(f"  Service URI: {service_uri}")
+
+    # 4. Detailed Authenticated Inspection
+    try:
+        print("\n  [+] Attempting ONVIF Authentication...")
+        cam = ONVIFCamera(ip, port, USER, PASS)
+        device_service = cam.create_devicemgmt_service()
+        
+        # Pull Hardware Info
+        info = device_service.GetDeviceInformation()
+        print(f"      Manufacturer : {info.Manufacturer}")
+        print(f"      Model        : {info.Model}")
+        print(f"      Firmware     : {info.FirmwareVersion}")
+        print(f"      Serial No.   : {info.SerialNumber}")
+
+        # Pull Stream Resolutions
+        media_service = cam.create_media_service()
+        profiles = media_service.GetProfiles()
+        print(f"\n  [+] Media Profiles Found ({len(profiles)}):")
+        for p in profiles:
+            res = getattr(p.VideoEncoderConfiguration, "Resolution", None)
+            res_str = f"{res.Width}x{res.Height}" if res else "N/A"
+            print(f"      - Profile: {p.Name} ({p.token}) | Res: {res_str}")
+
+    except Exception as e:
+        print(f"  [-] Authenticated inspection skipped: {e}")
+    print("\n")
+
+wsd.stop()
+'
