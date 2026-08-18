@@ -1,204 +1,282 @@
-sudo python3 - << 'EOF'
-import os, sys, time, socket, struct, select, ipaddress, concurrent.futures, subprocess, random, json
+python3 - << 'EOF'
+import os
+import subprocess
+import time
+import sys
+from datetime import datetime
 
-GREEN, RED, YELLOW, CYAN, BOLD, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[96m", "\033[1m", "\033[0m"
+# ANSI Color Codes
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+BLUE = '\033[94m'
+CYAN = '\033[96m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
 
-OUI_DB = {
-    "02:42": "Docker Virtual Veth Container", "00:50:56": "VMware Virtual NIC",
-    "00:0c:29": "VMware Virtual NIC", "08:00:27": "Oracle VirtualBox",
-    "52:54:00": "QEMU/KVM Virtual NIC", "b8:27:eb": "Raspberry Pi Foundation",
-    "dc:a6:32": "Raspberry Pi Foundation", "e4:5f:01": "Raspberry Pi Foundation",
-    "f4:6d:e2": "Ubiquiti Networks", "e8:65:d4": "TP-Link"
-}
-
-def get_vendor(mac):
-    mac_clean = mac.lower().replace("-", ":")
-    return OUI_DB.get(mac_clean[:5], OUI_DB.get(mac_clean[:8], "Unknown / Physical Device"))
+def run_cmd(cmd):
+    result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+    return result.stdout.strip()
 
 def get_tty_input(prompt):
-    try:
-        with open("/dev/tty", "r") as tty:
-            print(prompt, end="", flush=True)
-            return tty.readline().strip()
-    except Exception:
-        return ""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    with open('/dev/tty', 'r') as tty:
+        return tty.readline().strip()
 
-class RawARPProber:
-    def __init__(self, interface, src_ip, src_mac):
-        self.iface = interface
-        self.src_ip = src_ip
-        self.src_mac = src_mac
-        self.src_mac_bytes = bytes.fromhex(src_mac.replace(":", ""))
-        self.src_ip_bytes = socket.inet_aton(src_ip)
-
-    @staticmethod
-    def bytes_to_mac(mac_bytes):
-        return ":".join(f"{b:02x}" for b in mac_bytes)
-
-    def create_arp_packet(self, target_ip, op=1):
-        target_ip_bytes = socket.inet_aton(target_ip)
-        eth_hdr = struct.pack("!6s6sH", b"\xff\xff\xff\xff\xff\xff", self.src_mac_bytes, 0x0806)
-        arp_hdr = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, op, self.src_mac_bytes, self.src_ip_bytes, b"\x00"*6, target_ip_bytes)
-        return eth_hdr + arp_hdr
-
-    def probe_ip(self, target_ip, timeout=0.8):
-        try:
-            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-            sock.bind((self.iface, 0))
-            sock.setblocking(False)
-        except Exception: return []
-
-        sock.send(self.create_arp_packet(target_ip))
-        responses = []
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            r, _, _ = select.select([sock], [], [], 0.05)
-            if r:
-                try:
-                    data = sock.recv(2048)
-                    if len(data) >= 42 and struct.unpack("!H", data[12:14])[0] == 0x0806:
-                        opcode, sender_mac_b, sender_ip_b = struct.unpack("!H6s4s", data[20:32])
-                        if socket.inet_ntoa(sender_ip_b) == target_ip and opcode == 2:
-                            mac = self.bytes_to_mac(sender_mac_b)
-                            if mac not in responses: responses.append(mac)
-                except Exception: pass
-        sock.close()
-        return responses
-
-# --- REMEDIATION / FIX FUNCTIONS ---
-
-def fix_flush_arp(iface):
-    print(f"\n{CYAN}[+] Action: Flushing ARP and Neighbor Cache on {iface}...{RESET}")
-    res = subprocess.run(f"ip neighbor flush dev {iface}", shell=True, capture_output=True, text=True)
-    if res.returncode == 0:
-        print(f"  {GREEN}[✓] ARP cache successfully flushed.{RESET}")
-    else:
-        print(f"  {RED}[!] Failed to flush ARP cache: {res.stderr.strip()}{RESET}")
-
-def fix_renew_dhcp(iface):
-    print(f"\n{CYAN}[+] Action: Reacquiring DHCP Lease to resolve IP conflicts...{RESET}")
-    cmd = f"dhclient -r {iface} && dhclient {iface}"
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if res.returncode != 0:
-        cmd = "systemctl restart NetworkManager 2>/dev/null || systemctl restart networking 2>/dev/null"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    print(f"  {GREEN}[✓] Network interface restarted / DHCP reacquired.{RESET}")
-
-def fix_enable_ip_forwarding():
-    print(f"\n{CYAN}[+] Action: Enabling IPv4 Kernel Forwarding...{RESET}")
-    subprocess.run("sysctl -w net.ipv4.ip_forward=1", shell=True, capture_output=True)
-    try:
-        with open("/etc/sysctl.conf", "r+") as f:
-            content = f.read()
-            if "net.ipv4.ip_forward" not in content:
-                f.write("\nnet.ipv4.ip_forward=1\n")
-        print(f"  {GREEN}[✓] IPv4 Forwarding enabled and set to persistent in /etc/sysctl.conf.{RESET}")
-    except Exception as e:
-        print(f"  {YELLOW}[!] Enabled for current session, but failed to write /etc/sysctl.conf ({e}){RESET}")
-
-def fix_docker_subnets():
-    print(f"\n{CYAN}[+] Action: Reconfiguring Docker Default Subnet Pool...{RESET}")
-    daemon_path = "/etc/docker/daemon.json"
-    cfg = {}
-    if os.path.exists(daemon_path):
-        try:
-            with open(daemon_path, "r") as f: cfg = json.load(f)
-        except Exception: cfg = {}
-
-    cfg["default-address-pools"] = [{"base": "172.18.0.0/16", "size": 24}]
-    
-    try:
-        with open(daemon_path, "w") as f:
-            json.dump(cfg, f, indent=4)
-        print(f"  {GREEN}[✓] Updated {daemon_path} with pool 172.18.0.0/16.{RESET}")
-        print(f"  [*] Restarting Docker service...")
-        subprocess.run("systemctl restart docker", shell=True)
-        print(f"  {GREEN}[✓] Docker restarted successfully.{RESET}")
-    except Exception as e:
-        print(f"  {RED}[!] Failed to update Docker daemon configuration: {e}{RESET}")
-
-def main():
-    if os.geteuid() != 0:
-        print(f"{RED}[!] Must be run as root (sudo).{RESET}")
-        sys.exit(1)
-
-    print(f"\n{BOLD}{CYAN}=== DEEP DIAGNOSTIC & AUTOMATED RESOLUTION TOOL ==={RESET}")
-
-    # Determine default route interface & IPs
-    import fcntl
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    with open("/proc/net/route") as f: routes = f.readlines()[1:]
-    
-    def_iface, def_gw = None, None
-    for r in routes:
-        p = r.strip().split()
-        if p[1] == "00000000":
-            def_iface = p[0]
-            def_gw = str(ipaddress.IPv4Address(struct.unpack("<L", struct.pack(">L", int(p[2], 16)))[0]))
-            break
-
-    if not def_iface:
-        print(f"{RED}[!] No default network route found.{RESET}")
-        sys.exit(1)
-
-    my_ip = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", def_iface[:15].encode("utf-8")))[20:24])
-    with open(f"/sys/class/net/{def_iface}/address") as f: my_mac = f.read().strip()
-
-    print(f"\n{BOLD}[+] Interface:{RESET} {def_iface} | {BOLD}IP:{RESET} {my_ip} | {BOLD}MAC:{RESET} {my_mac} | {BOLD}Gateway:{RESET} {def_gw}")
-
-    prober = RawARPProber(def_iface, my_ip, my_mac)
-
-    # Quick Checks
-    ip_conflict = len([m for m in prober.probe_ip(my_ip, 0.8) if m.lower() != my_mac.lower()]) > 0
-    gw_conflict = len(prober.probe_ip(def_gw, 0.8)) > 1
-
-    # Check IP forwarding
-    fwd_enabled = True
-    try:
-        with open("/proc/sys/net/ipv4/ip_forward") as f:
-            fwd_enabled = f.read().strip() == "1"
-    except Exception: pass
-
-    print(f"\n{BOLD}{CYAN}=== AUDIT SUMMARY ==={RESET}")
-    print(f" • IP Conflict Detected      : {RED if ip_conflict else GREEN}{'YES' if ip_conflict else 'NO'}{RESET}")
-    print(f" • Gateway Collision         : {RED if gw_conflict else GREEN}{'YES' if gw_conflict else 'NO'}{RESET}")
-    print(f" • Kernel Forwarding Enabled : {GREEN if fwd_enabled else RED}{'YES' if fwd_enabled else 'NO (Issue for containers)'}{RESET}")
-
-    # --- INTERACTIVE RESOLUTION MENU ---
-    while True:
-        print(f"\n{BOLD}{CYAN}=== REMEDIATION & FIX MENU ==={RESET}")
-        print(" [1] Flush ARP / Neighbor Cache")
-        print(" [2] Renew DHCP Lease / Reset Interface")
-        print(" [3] Fix Docker Subnet Overlaps (Reconfigure daemon.json to 172.18.0.0/16)")
-        print(" [4] Enable IPv4 Kernel Forwarding")
-        print(" [5] Apply ALL Recommended Fixes")
-        print(" [0] Exit")
-
-        choice = get_tty_input(f"\n{BOLD}Select an action [0-5]: {RESET}")
-
-        if choice == "1":
-            fix_flush_arp(def_iface)
-        elif choice == "2":
-            fix_renew_dhcp(def_iface)
-        elif choice == "3":
-            fix_docker_subnets()
-        elif choice == "4":
-            fix_enable_ip_forwarding()
-        elif choice == "5":
-            fix_flush_arp(def_iface)
-            if not fwd_enabled: fix_enable_ip_forwarding()
-            fix_docker_subnets()
-            fix_renew_dhcp(def_iface)
-            print(f"\n{GREEN}{BOLD}[✓] All automated fixes applied successfully.{RESET}")
-            break
-        elif choice == "0" or choice == "":
-            print("\nExiting.")
-            break
+def get_valid_input(prompt, max_retries=3):
+    """Loops until user enters text. Returns None if max empty tries are reached."""
+    attempts = 0
+    while attempts < max_retries:
+        val = get_tty_input(prompt)
+        if val:
+            return val
+        attempts += 1
+        remaining = max_retries - attempts
+        if remaining > 0:
+            print(f"{RED}[!] Input cannot be blank. {remaining} empty attempt(s) left before returning to menu.{RESET}")
         else:
-            print(f"{RED}Invalid option, try again.{RESET}")
+            print(f"\n{RED}[!] Too many blank inputs. Returning to main menu...{RESET}")
+            return None
+    return None
 
-if __name__ == "__main__":
-    main()
+def show_disk_list():
+    print(f"\n{CYAN}[Available Disks & Partitions]{RESET}")
+    subprocess.run(["diskutil", "list"])
+
+while True:
+    print(f"\n{BLUE}=================================================={RESET}")
+    print(f"{BLUE}   macOS Ultimate Drive Diagnostic & Repair Pro   {RESET}")
+    print(f"{BLUE}=================================================={RESET}")
+    print("  [1] Full Diagnostic Suite (Health + Repair + Speed Test)")
+    print("  [2] Quick Speed Benchmark Only (1GB Read/Write Test)")
+    print("  [3] File System Repair Tool (Fix Exit Code 8, Superblock)")
+    print("  [4] Emergency Read-Only Mount (For pulling files off bad drives)")
+    print("  [5] Smart Hardware Attribute Dump (View deep hardware stats)")
+    print("  [6] Erase and Reformat Partition (Wipe specific volume)")
+    print("  [7] Reformat & Unify Whole Disk (Erase parent disk into 1 volume)")
+    print("  [8] Sector-by-Sector Clone / Backup (Copy source to destination)")
+    print("  [9] Exit")
+    print(f"{BLUE}=================================================={RESET}")
+    
+    choice = get_tty_input("Select an option (1-9): ")
+    
+    if choice == '9':
+        print("Exiting tool. Goodbye!")
+        break
+        
+    if choice in ['1', '2', '3', '4', '5', '6', '7', '8']:
+        show_disk_list()
+        print(f"\n{YELLOW}--------------------------------------------------{RESET}")
+        
+        target = None
+        source = None
+        dest = None
+
+        if choice == '7':
+            target = get_valid_input("Enter parent disk identifier to unify (e.g., disk4): ")
+        elif choice == '8':
+            source = get_valid_input("Enter SOURCE disk/partition to clone (e.g., disk2s1): ")
+            if source:
+                dest = get_valid_input("Enter DESTINATION disk/partition (WARNING: WILL BE ERASED) (e.g., disk3s1): ")
+            target = source # placeholder for logging
+        else:
+            target = get_valid_input("Enter target partition identifier (e.g., disk4s1): ")
+
+        # If any required input timed out / hit 3 blank tries, abort and loop back to menu
+        if not target or (choice == '8' and not dest):
+            continue
+
+        # --- OPTION 1: FULL DIAGNOSTIC SUITE ---
+        if choice == '1':
+            print(f"\n{CYAN}[1/3] Checking Drive Info & Health for {target}...{RESET}")
+            info_output = run_cmd(f"diskutil info {target}")
+            print(info_output)
+
+            is_whole_disk = "Whole: Yes" in info_output or not "s" in target
+
+            if is_whole_disk:
+                print(f"\n{YELLOW}[!] Note: '{target}' is a whole physical disk container, not a mountable partition slice.{RESET}")
+                print(f"{YELLOW}Skipping volume file-system checks (use option [7] to unify/format).{RESET}")
+            else:
+                print(f"\n{CYAN}[2/3] Verifying File System for {target}...{RESET}")
+                verify_output = run_cmd(f"diskutil verifyVolume {target}")
+                print(verify_output)
+
+                if "appears to be OK" not in verify_output:
+                    print(f"\n{RED}[!] Corruption detected. Running automated repair sequence...{RESET}")
+                    subprocess.run(["diskutil", "repairVolume", target])
+
+            mount_point = None
+            for line in info_output.split('\n'):
+                if "Mount Point" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) > 1:
+                        mount_point = parts[1].strip()
+
+            if (not mount_point or mount_point == "Not Mounted") and not is_whole_disk:
+                print(f"{YELLOW}[!] Target unmounted. Attempting mount...{RESET}")
+                subprocess.run(["diskutil", "mount", target])
+                info_output = run_cmd(f"diskutil info {target}")
+                for line in info_output.split('\n'):
+                    if "Mount Point" in line:
+                        parts = line.split(":", 1)
+                        if len(parts) > 1:
+                            mount_point = parts[1].strip()
+
+            if mount_point and mount_point != "Not Mounted":
+                print(f"\n{CYAN}[3/3] Running Blackmagic-Style Speed Test on [{mount_point}]...{RESET}")
+                test_file = os.path.join(mount_point, "python_speed_test.tmp")
+                block_size = 1024 * 1024
+                chunk = b'\0' * block_size
+
+                start_time = time.perf_counter()
+                with open(test_file, "wb") as f:
+                    for _ in range(1024):
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                write_mb = 1024 / (time.perf_counter() - start_time)
+                print(f"--> Write Speed: {GREEN}{write_mb:.2f} MB/s{RESET}")
+
+                start_time = time.perf_counter()
+                with open(test_file, "rb") as f:
+                    while f.read(block_size):
+                        pass
+                read_mb = 1024 / (time.perf_counter() - start_time)
+                print(f"--> Read Speed:  {GREEN}{read_mb:.2f} MB/s{RESET}")
+                
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+                    
+                save_report = get_tty_input("\nWould you like to save this diagnostic report to your Desktop? (y/n): ")
+                if save_report.lower() == 'y':
+                    desktop_path = os.path.expanduser("~/Desktop")
+                    report_file = os.path.join(desktop_path, f"Drive_Report_{target}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+                    with open(report_file, "w") as rep:
+                        rep.write(f"=== macOS Drive Diagnostic Report ===\nTarget: {target}\nDate: {datetime.now()}\n\n{info_output}\n\nWrite Speed: {write_mb:.2f} MB/s\nRead Speed: {read_mb:.2f} MB/s")
+                    print(f"{GREEN}Report saved successfully to: {report_file}{RESET}")
+            else:
+                print(f"{RED}[!] Cannot run speed test because target has no mounted file system volume.{RESET}")
+
+        # --- OPTION 2: QUICK SPEED BENCHMARK ---
+        elif choice == '2':
+            info_output = run_cmd(f"diskutil info {target}")
+            mount_point = None
+            for line in info_output.split('\n'):
+                if "Mount Point" in line:
+                    parts = line.split(":", 1)
+                    if len(parts) > 1:
+                        mount_point = parts[1].strip()
+            
+            if not mount_point or mount_point == "Not Mounted":
+                print(f"{YELLOW}Drive unmounted. Attempting auto-mount...{RESET}")
+                subprocess.run(["diskutil", "mount", target])
+                info_output = run_cmd(f"diskutil info {target}")
+                for line in info_output.split('\n'):
+                    if "Mount Point" in line:
+                        parts = line.split(":", 1)
+                        if len(parts) > 1:
+                            mount_point = parts[1].strip()
+
+            if mount_point and mount_point != "Not Mounted":
+                print(f"\n{CYAN}Running Quick Benchmark on {mount_point}...{RESET}")
+                test_file = os.path.join(mount_point, "quick_bench.tmp")
+                chunk = b'\0' * (1024 * 1024)
+                
+                start = time.perf_counter()
+                with open(test_file, "wb") as f:
+                    for _ in range(512):
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                w_speed = 512 / (time.perf_counter() - start)
+                
+                start = time.perf_counter()
+                with open(test_file, "rb") as f:
+                    while f.read(1024 * 1024):
+                        pass
+                r_speed = 512 / (time.perf_counter() - start)
+                
+                if os.path.exists(test_file):
+                    os.remove(test_file)
+                    
+                print(f"--> Quick Write: {GREEN}{w_speed:.2f} MB/s{RESET}")
+                print(f"--> Quick Read:  {GREEN}{r_speed:.2f} MB/s{RESET}")
+            else:
+                print(f"{RED}Error: Drive could not be mounted for benchmarking.{RESET}")
+
+        # --- OPTION 3: ADVANCED FILE SYSTEM REPAIR ---
+        elif choice == '3':
+            print(f"\n{CYAN}Running deep file system repair on {target}...{RESET}")
+            subprocess.run(["diskutil", "unmount", "force", target])
+            info_output = run_cmd(f"diskutil info {target}")
+            fs_type = "hfs" if "HFS" in info_output else "apfs"
+            
+            print(f"Executing low-level fsck_{fs_type}...")
+            subprocess.run(f"sudo fsck_{fs_type} -y /dev/{target}", shell=True)
+            subprocess.run(["diskutil", "repairVolume", target])
+            subprocess.run(["diskutil", "mount", target])
+            print(f"{GREEN}Repair sequence completed.{RESET}")
+
+        # --- OPTION 4: EMERGENCY READ-ONLY MOUNT ---
+        elif choice == '4':
+            print(f"\n{CYAN}Forcing Read-Only mount for data recovery...{RESET}")
+            res = run_cmd(f"diskutil mount readOnly {target}")
+            print(res)
+            print(f"{GREEN}Check your Mac Desktop/Finder to copy your files immediately!{RESET}")
+
+        # --- OPTION 5: SMART ATTRIBUTE DUMP ---
+        elif choice == '5':
+            print(f"\n{CYAN}Fetching hardware stats for {target}...{RESET}")
+            res = run_cmd(f"diskutil info {target}")
+            print(res)
+
+        # --- OPTION 6: ERASE & REFORMAT PARTITION ---
+        elif choice == '6':
+            print(f"\n{RED}[WARNING] This will permanently erase partition {target}!{RESET}")
+            confirm = get_tty_input("Type 'YES' to proceed with formatting: ")
+            if confirm == 'YES':
+                new_name = get_valid_input("Enter new drive name: ")
+                if new_name:
+                    print(f"Formatting {target} to APFS...")
+                    subprocess.run(["diskutil", "eraseVolume", "APFS", new_name, target])
+                    print(f"{GREEN}Formatting complete!{RESET}")
+            else:
+                print("Formatting aborted.")
+
+        # --- OPTION 7: REFORMAT & UNIFY WHOLE DISK ---
+        elif choice == '7':
+            print(f"\n{RED}[WARNING] This will wipe ENTIRE physical disk '{target}' and merge it into 1 partition!{RESET}")
+            confirm = get_tty_input("Type 'YES' to confirm wiping the entire disk: ")
+            if confirm == 'YES':
+                new_name = get_valid_input("Enter a name for the unified drive: ")
+                if new_name:
+                    print(f"\nSelect File System Format:")
+                    print("  [1] APFS (Best for Mac-only use)")
+                    print("  [2] ExFAT (Best if used between Mac and Windows)")
+                    fmt_choice = get_tty_input("Enter choice (1-2, default is 1): ")
+                    file_system = "ExFAT" if fmt_choice == '2' else "APFS"
+                    
+                    print(f"\n{CYAN}Wiping and reformatting {target} into a single {file_system} volume...{RESET}")
+                    subprocess.run(["diskutil", "eraseDisk", file_system, new_name, target])
+                    print(f"{GREEN}Unified formatting complete!{RESET}")
+            else:
+                print("Operation cancelled.")
+
+        # --- OPTION 8: CLONE / BACKUP UTILITY ---
+        elif choice == '8':
+            print(f"\n{RED}[WARNING] Source: {source} -> Destination: {dest}{RESET}")
+            print(f"{RED}All data on the destination drive will be permanently overwritten!{RESET}")
+            confirm = get_tty_input("Type 'CLONE' to confirm the cloning process: ")
+            if confirm == 'CLONE':
+                print(f"\n{CYAN}Cloning partition data using Apple Software Restore (asr)...{RESET}")
+                clone_cmd = f"sudo asr restore --source /dev/{source} --target /dev/{dest} --erase --noprompt"
+                print(f"Executing: {clone_cmd}")
+                subprocess.run(clone_cmd, shell=True)
+                print(f"{GREEN}Cloning process finished.{RESET}")
+            else:
+                print("Cloning cancelled.")
+                
+        get_tty_input("\nPress [Enter] to return to the main menu...")
 EOF
