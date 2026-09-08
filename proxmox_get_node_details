@@ -1,0 +1,175 @@
+cat << 'EOF' > generate_notes.sh
+#!/usr/bin/env bash
+
+# Clear screen and grab hostname
+clear
+NODE_NAME=$(hostname)
+
+echo "# ⚙️ Node Hardware Profile Summary: $NODE_NAME"
+echo "---"
+echo ""
+echo "### 🧩 Core System Specs"
+echo ""
+
+echo "- **Model/Chassis:** \`dmidecode -s system-product-name\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# dmidecode -s system-product-name"
+echo "     > $(dmidecode -s system-product-name 2>/dev/null || echo 'Unknown Chassis')"
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **Motherboard:** \`dmidecode -s baseboard-product-name\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# dmidecode -s baseboard-product-name"
+echo "     > $(dmidecode -s baseboard-product-name 2>/dev/null || echo 'Unknown Board')"
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **CPU:** \`lscpu | grep \"Model name\" | sed 's/Model name:[ \t]*//'\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# lscpu | grep \"Model name\" | sed 's/Model name:[ \t]*//'"
+echo "     > $(lscpu 2>/dev/null | grep "Model name" | sed 's/Model name:[ \t]*//')"
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **RAM Total:** \`free -h | awk '/Mem:/ {print \$2}'\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# free -h | awk '/Mem:/ {print \$2}'"
+echo "     > $(free -h 2>/dev/null | awk '/Mem:/ {print $2}')"
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **RAM Slots Layout:** \`dmidecode --type memory | grep -E \"Size|Speed|Type|Manufacturer\"...\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# dmidecode --type memory | grep -E \"Size|Speed|Type|Manufacturer\" | grep -v \"No Module Installed\""
+if command -v dmidecode &>/dev/null; then
+    dmidecode --type memory 2>/dev/null | grep -E "Size|Speed|Type|Manufacturer" | grep -v "No Module Installed" | sed 's/^/     > /'
+fi
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **Boot Drive Physical Serial:** \`lsblk -o NAME,SIZE,MODEL,SERIAL | grep -E \"sda|nvme0n1\"\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# lsblk -o NAME,SIZE,MODEL,SERIAL | grep -E \"sda|nvme0n1\""
+if lsblk -o NAME,SIZE,MODEL,SERIAL 2>/dev/null | grep -E "sda|nvme0n1" &>/dev/null; then
+    lsblk -o NAME,SIZE,MODEL,SERIAL 2>/dev/null | grep -E "sda|nvme0n1" | sed 's/^/     > /'
+else
+    echo "     > No standard sda or nvme0n1 match found."
+fi
+echo "     \`\`\`"
+echo ""
+echo "---"
+echo ""
+echo "### 🗄️ Storage Arrays & Disks"
+echo ""
+
+echo "- **All Connected Disks:** \`lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS"
+lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINTS 2>/dev/null | sed 's/^/     > /'
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **ZFS Pool Status:** \`zpool list\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# zpool list"
+if command -v zpool &>/dev/null && zpool list &>/dev/null; then
+    zpool list 2>/dev/null | sed 's/^/     > /'
+else
+    echo "     > No active ZFS pools found"
+fi
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **LVM Free Space:** \`vgs\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# vgs"
+if command -v vgs &>/dev/null && vgs &>/dev/null; then
+    vgs 2>/dev/null | sed 's/^/     > /'
+else
+    echo "     > No Volume Groups found"
+fi
+echo "     \`\`\`"
+echo ""
+echo "---"
+echo ""
+echo "### 🌐 Network & PCI Topology"
+echo ""
+
+echo "- **Active Network Interfaces:** \`ip -br link\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# ip -br link"
+ip -br link 2>/dev/null | sed 's/^/     > /'
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **Proxmox Network Bridges:** \`cat /etc/pve/interfaces | grep vmbr\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# cat /etc/pve/sdn/regions.cfg 2>/dev/null || cat /etc/pve/interfaces 2>/dev/null | grep vmbr"
+(cat /etc/pve/sdn/regions.cfg 2>/dev/null || cat /etc/pve/interfaces 2>/dev/null | grep vmbr) | sed 's/^/     > /'
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **GPUs / PCIe Devices:** \`lspci | grep -E \"VGA|3D|Controller\"\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# lspci | grep -E \"VGA|3D|Controller\""
+if command -v lspci &>/dev/null; then
+    lspci 2>/dev/null | grep -E "VGA|3D|Controller" | sed 's/^/     > /'
+fi
+echo "     \`\`\`"
+echo ""
+echo ""
+
+echo "- **Storage Controllers / HBAs:** \`lspci | grep -iE \"sas|raid|storage\"\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# lspci | grep -iE \"sas|raid|storage\""
+if command -v lspci &>/dev/null; then
+    lspci 2>/dev/null | grep -iE "sas|raid|storage" | sed 's/^/     > /'
+fi
+echo "     \`\`\`"
+echo ""
+echo "---"
+echo ""
+echo "### 🔌 Physical Location & Power"
+echo ""
+
+echo "- **UPS Battery Status:** \`apcaccess status / upsc\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# apcaccess status 2>/dev/null || upsc ups 2>/dev/null | grep -E \"STATUS|BCHARGE|LOAD\""
+UPS_OUT=$(apcaccess status 2>/dev/null || upsc ups 2>/dev/null | grep -E "STATUS|BCHARGE|LOAD")
+if [ -n "$UPS_OUT" ]; then
+    echo "$UPS_OUT" | sed 's/^/     > /'
+else
+    echo "     > No UPS driver (apcupsd/nut) running or detected."
+fi
+echo "     \`\`\`"
+echo ""
+echo "---"
+echo ""
+echo "### 🛠️ IPMI / Out-of-Band Management"
+echo ""
+
+echo "- **BMC/IPMI IP Address:** \`ipmitool lan print 1\`"
+echo "     \`\`\`text"
+echo "     root@${NODE_NAME}:~# ipmitool lan print 1 | grep \"IP Address\""
+IPMI_OUT=$(ipmitool lan print 1 2>/dev/null | grep "IP Address")
+if [ -n "$IPMI_OUT" ]; then
+    echo "$IPMI_OUT" | sed 's/^/     > /'
+else
+    echo "     > ipmitool not installed or BMC configuration unavailable."
+fi
+echo "     \`\`\`"
+echo ""
+
+EOF
+chmod +x generate_notes.sh
+./generate_notes.sh
